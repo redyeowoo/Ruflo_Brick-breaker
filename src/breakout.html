@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>벽돌깨기</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; background: #10131a; color: #c9d1e0;
+    font-family: "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+  }
+  canvas {
+    max-width: 96vw; max-height: 86vh; background: #181d29;
+    border: 2px solid #2c3446; border-radius: 6px; cursor: none;
+  }
+  p { margin: 0; font-size: 14px; opacity: 0.75; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<p>마우스 또는 ← → 키로 패들 이동 · 스페이스 키로 발사 / 다시 시작</p>
+<script>
+(function () {
+  'use strict';
+
+  // ---------------------------------------------------------------------
+  // Configuration (px, seconds, px/second)
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    width: 800,
+    height: 600,
+    lives: 3,
+
+    paddleWidth: 110,
+    paddleHeight: 14,
+    paddleBottomGap: 40,      // distance from the paddle's top edge to the canvas bottom
+    paddleSpeed: 560,         // keyboard movement
+
+    ballRadius: 8,
+    ballSpeed: 420,
+    launchAngleDeg: 20,       // from vertical, towards the right
+    maxBounceAngleDeg: 60,    // from vertical, reached at the paddle's edges
+    minVerticalRatio: 0.2,    // |vy| / speed never drops below this
+
+    brickRows: 6,
+    brickCols: 10,
+    brickHeight: 22,
+    brickGap: 6,
+    brickTop: 70,
+    brickSideMargin: 30,
+    brickScore: 10,
+
+    maxDt: 0.05,              // clamp for long frames (tab switch)
+    maxStepPx: 4              // ball travel per sub-step; must stay below ballRadius
+  };
+
+  const STATUS = { READY: 'ready', PLAYING: 'playing', WON: 'won', LOST: 'lost' };
+
+  // ---------------------------------------------------------------------
+  // Game logic: mutates a plain state object in place, no DOM access
+  // ---------------------------------------------------------------------
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function degToRad(degrees) {
+    return degrees * Math.PI / 180;
+  }
+
+  function brickWidth(cfg) {
+    const totalGap = cfg.brickGap * (cfg.brickCols - 1);
+    return (cfg.width - 2 * cfg.brickSideMargin - totalGap) / cfg.brickCols;
+  }
+
+  // Rejects configs that could never produce a playable, winnable game.
+  function validateConfig(cfg) {
+    const problems = [];
+    if (!(cfg.brickRows >= 1 && cfg.brickCols >= 1)) problems.push('at least one brick is required');
+    else if (!(brickWidth(cfg) > 0)) problems.push('bricks do not fit the field width');
+    if (!(cfg.brickHeight > 0)) problems.push('brickHeight must be positive');
+    if (!(cfg.paddleWidth > 0 && cfg.paddleWidth <= cfg.width)) problems.push('paddle must fit the field width');
+    if (!(cfg.maxStepPx > 0 && cfg.maxStepPx < cfg.ballRadius)) problems.push('maxStepPx must be positive and below ballRadius');
+    if (problems.length > 0) throw new Error('Invalid Breakout config: ' + problems.join('; '));
+  }
+
+  function createBricks(cfg) {
+    const w = brickWidth(cfg);
+    const bricks = [];
+    for (let row = 0; row < cfg.brickRows; row++) {
+      for (let col = 0; col < cfg.brickCols; col++) {
+        bricks.push({
+          row, col, w, h: cfg.brickHeight, alive: true,
+          x: cfg.brickSideMargin + col * (w + cfg.brickGap),
+          y: cfg.brickTop + row * (cfg.brickHeight + cfg.brickGap)
+        });
+      }
+    }
+    return bricks;
+  }
+
+  function createState(config) {
+    const cfg = Object.assign({}, CONFIG, config);
+    validateConfig(cfg);
+    const bricks = createBricks(cfg);
+    const state = {
+      config: cfg,
+      status: STATUS.READY,
+      score: 0,
+      lives: cfg.lives,
+      paddle: {
+        x: (cfg.width - cfg.paddleWidth) / 2,
+        y: cfg.height - cfg.paddleBottomGap,
+        w: cfg.paddleWidth,
+        h: cfg.paddleHeight
+      },
+      ball: { x: 0, y: 0, vx: 0, vy: 0, r: cfg.ballRadius },
+      bricks,
+      bricksLeft: bricks.length
+    };
+    resetBall(state);
+    return state;
+  }
+
+  // Parks the ball on top of the paddle, waiting for launch.
+  function resetBall(state) {
+    const { ball, paddle } = state;
+    ball.x = paddle.x + paddle.w / 2;
+    ball.y = paddle.y - ball.r;
+    ball.vx = 0;
+    ball.vy = 0;
+  }
+
+  function setBallDirection(state, angleFromVertical) {
+    const speed = state.config.ballSpeed;
+    state.ball.vx = speed * Math.sin(angleFromVertical);
+    state.ball.vy = -speed * Math.cos(angleFromVertical);
+  }
+
+  function launch(state) {
+    if (state.status !== STATUS.READY) return;
+    setBallDirection(state, degToRad(state.config.launchAngleDeg));
+    state.status = STATUS.PLAYING;
+  }
+
+  function restart(state) {
+    Object.assign(state, createState(state.config));
+  }
+
+  // The single action key: launch when waiting, restart after win/lose.
+  function pressAction(state) {
+    if (state.status === STATUS.READY) launch(state);
+    else if (state.status !== STATUS.PLAYING) restart(state);
+  }
+
+  function isOver(state) {
+    return state.status === STATUS.WON || state.status === STATUS.LOST;
+  }
+
+  // Centres the paddle on centerX (canvas coordinates), kept inside the field.
+  // Ignored once the game has ended.
+  function movePaddle(state, centerX) {
+    if (isOver(state) || !Number.isFinite(centerX)) return;
+    const { paddle, config } = state;
+    paddle.x = clamp(centerX - paddle.w / 2, 0, config.width - paddle.w);
+    if (state.status === STATUS.READY) resetBall(state);
+  }
+
+  // Returns null, or the contact normal (pointing out of the rect) and the
+  // penetration depth along it.
+  function circleRectHit(ball, rect) {
+    const dx = ball.x - clamp(ball.x, rect.x, rect.x + rect.w);
+    const dy = ball.y - clamp(ball.y, rect.y, rect.y + rect.h);
+    const distSq = dx * dx + dy * dy;
+    if (distSq >= ball.r * ball.r) return null;
+    if (distSq > 0) {
+      const dist = Math.sqrt(distSq);
+      return { nx: dx / dist, ny: dy / dist, depth: ball.r - dist };
+    }
+    // Ball centre is inside the rect: leave through the nearest face.
+    const left = ball.x - rect.x;
+    const right = rect.x + rect.w - ball.x;
+    const top = ball.y - rect.y;
+    const bottom = rect.y + rect.h - ball.y;
+    const nearest = Math.min(left, right, top, bottom);
+    if (nearest === top) return { nx: 0, ny: -1, depth: top + ball.r };
+    if (nearest === bottom) return { nx: 0, ny: 1, depth: bottom + ball.r };
+    if (nearest === left) return { nx: -1, ny: 0, depth: left + ball.r };
+    return { nx: 1, ny: 0, depth: right + ball.r };
+  }
+
+  // Pushes the ball out along the normal and mirrors its velocity, unless it
+  // is already moving away (prevents flipping twice on one contact).
+  function reflect(ball, hit) {
+    ball.x += hit.nx * hit.depth;
+    ball.y += hit.ny * hit.depth;
+    const dot = ball.vx * hit.nx + ball.vy * hit.ny;
+    if (dot < 0) {
+      ball.vx -= 2 * dot * hit.nx;
+      ball.vy -= 2 * dot * hit.ny;
+    }
+  }
+
+  // Restores the configured speed and rules out near-horizontal flight,
+  // which a corner bounce could otherwise produce.
+  function normalizeVelocity(ball, cfg) {
+    const speed = cfg.ballSpeed;
+    const minVy = speed * cfg.minVerticalRatio;
+    // Rescale first so |vy| can never exceed the speed under the square root.
+    let vy = ball.vy * speed / (Math.hypot(ball.vx, ball.vy) || 1);
+    if (Math.abs(vy) < minVy) vy = vy < 0 ? -minVy : minVy;
+    ball.vy = vy;
+    ball.vx = (ball.vx < 0 ? -1 : 1) * Math.sqrt(speed * speed - vy * vy);
+  }
+
+  function bounceOffWalls(state) {
+    const { ball, config } = state;
+    if (ball.x < ball.r) {
+      ball.x = ball.r;
+      ball.vx = Math.abs(ball.vx);
+    } else if (ball.x > config.width - ball.r) {
+      ball.x = config.width - ball.r;
+      ball.vx = -Math.abs(ball.vx);
+    }
+    if (ball.y < ball.r) {
+      ball.y = ball.r;
+      ball.vy = Math.abs(ball.vy);
+    }
+  }
+
+  // Contact for a ball whose centre is at or below the paddle's top edge.
+  // The normal never points up, so such a ball cannot be lifted back into play.
+  function paddleSideHit(ball, paddle, hit) {
+    if (hit.ny >= 0) return hit;
+    const left = ball.x - paddle.x;
+    const right = paddle.x + paddle.w - ball.x;
+    return left < right
+      ? { nx: -1, ny: 0, depth: left + ball.r }
+      : { nx: 1, ny: 0, depth: right + ball.r };
+  }
+
+  // Only a descending ball whose centre is above the top edge is saved: it
+  // leaves upward at an angle set by where along the paddle it landed.
+  // Anything lower is pushed out sideways or downward and keeps falling.
+  function bounceOffPaddle(state) {
+    const { ball, paddle, config } = state;
+    const hit = circleRectHit(ball, paddle);
+    if (!hit) return;
+    if (ball.y < paddle.y) {
+      if (ball.vy <= 0) return;
+      const half = paddle.w / 2;
+      const offset = clamp((ball.x - (paddle.x + half)) / half, -1, 1);
+      setBallDirection(state, offset * degToRad(config.maxBounceAngleDeg));
+      ball.y = paddle.y - ball.r;
+      return;
+    }
+    reflect(ball, paddleSideHit(ball, paddle, hit));
+    // Squeezed between paddle and wall: stay in the field and fall past.
+    ball.x = clamp(ball.x, ball.r, config.width - ball.r);
+  }
+
+  // Removes at most one brick: the one the ball has sunk into the deepest.
+  function bounceOffBricks(state) {
+    let target = null;
+    let targetHit = null;
+    for (const brick of state.bricks) {
+      if (!brick.alive) continue;
+      const hit = circleRectHit(state.ball, brick);
+      if (hit && (!targetHit || hit.depth > targetHit.depth)) {
+        target = brick;
+        targetHit = hit;
+      }
+    }
+    if (!target) return;
+    target.alive = false;
+    state.bricksLeft -= 1;
+    state.score += state.config.brickScore;
+    reflect(state.ball, targetHit);
+    normalizeVelocity(state.ball, state.config);
+    if (state.bricksLeft === 0) state.status = STATUS.WON;
+  }
+
+  function loseLife(state) {
+    state.lives -= 1;
+    state.status = state.lives > 0 ? STATUS.READY : STATUS.LOST;
+    if (state.status === STATUS.READY) resetBall(state);
+  }
+
+  function substep(state, dt) {
+    const { ball, config } = state;
+    ball.x += ball.vx * dt;
+    ball.y += ball.vy * dt;
+    bounceOffWalls(state);
+    bounceOffPaddle(state);
+    bounceOffBricks(state);
+    // A win in this same sub-step takes precedence over the ball dropping out.
+    if (state.status === STATUS.PLAYING && ball.y - ball.r > config.height) loseLife(state);
+  }
+
+  function moveBall(state, dt) {
+    const { config } = state;
+    const steps = Math.max(1, Math.ceil(config.ballSpeed * dt / config.maxStepPx));
+    for (let i = 0; i < steps && state.status === STATUS.PLAYING; i++) {
+      substep(state, dt / steps);
+    }
+  }
+
+  // Advances the game by dtSeconds. input: { left: boolean, right: boolean }.
+  // Does nothing once the game has ended.
+  function step(state, dtSeconds, input) {
+    if (isOver(state)) return state;
+    const dt = Number.isFinite(dtSeconds) ? clamp(dtSeconds, 0, state.config.maxDt) : 0;
+    const direction = (input && input.right ? 1 : 0) - (input && input.left ? 1 : 0);
+    if (direction !== 0) {
+      const centre = state.paddle.x + state.paddle.w / 2;
+      movePaddle(state, centre + direction * state.config.paddleSpeed * dt);
+    }
+    if (state.status === STATUS.PLAYING) moveBall(state, dt);
+    return state;
+  }
+
+  function statusMessage(state) {
+    switch (state.status) {
+      case STATUS.READY:
+        return { title: '벽돌깨기', hint: '스페이스 키를 눌러 공을 발사하세요' };
+      case STATUS.WON:
+        return { title: '승리! 모든 벽돌을 깼습니다', hint: '스페이스 키를 눌러 다시 시작' };
+      case STATUS.LOST:
+        return { title: '게임 오버', hint: '스페이스 키를 눌러 다시 시작' };
+      default:
+        return null;
+    }
+  }
+
+  globalThis.Breakout = {
+    CONFIG, STATUS, createState, resetBall, launch, restart, pressAction, movePaddle,
+    step, circleRectHit, reflect, normalizeVelocity, statusMessage
+  };
+
+  // ---------------------------------------------------------------------
+  // Rendering: reads state only
+  // ---------------------------------------------------------------------
+  const THEME = {
+    background: '#181d29',
+    paddle: '#e6edf7',
+    ball: '#ffd166',
+    text: '#e6edf7',
+    overlay: 'rgba(16, 19, 26, 0.72)',
+    brickRows: ['#ef476f', '#f78c6b', '#ffd166', '#06d6a0', '#118ab2', '#9b5de5'],
+    hudFont: '18px "Malgun Gothic", sans-serif',
+    titleFont: 'bold 36px "Malgun Gothic", sans-serif',
+    hintFont: '20px "Malgun Gothic", sans-serif',
+    hudY: 34,
+    hudMargin: 30,
+    titleOffsetY: 20,
+    hintOffsetY: 62
+  };
+
+  function drawBricks(ctx, state) {
+    for (const brick of state.bricks) {
+      if (!brick.alive) continue;
+      ctx.fillStyle = THEME.brickRows[brick.row % THEME.brickRows.length];
+      ctx.fillRect(brick.x, brick.y, brick.w, brick.h);
+    }
+  }
+
+  function drawHud(ctx, state) {
+    ctx.fillStyle = THEME.text;
+    ctx.font = THEME.hudFont;
+    ctx.textAlign = 'left';
+    ctx.fillText('점수: ' + state.score, THEME.hudMargin, THEME.hudY);
+    ctx.textAlign = 'right';
+    ctx.fillText('목숨: ' + state.lives, state.config.width - THEME.hudMargin, THEME.hudY);
+  }
+
+  function drawMessage(ctx, state) {
+    const message = statusMessage(state);
+    if (!message) return;
+    const { width, height } = state.config;
+    if (state.status !== STATUS.READY) {
+      ctx.fillStyle = THEME.overlay;
+      ctx.fillRect(0, 0, width, height);
+    }
+    ctx.fillStyle = THEME.text;
+    ctx.textAlign = 'center';
+    ctx.font = THEME.titleFont;
+    ctx.fillText(message.title, width / 2, height / 2 + THEME.titleOffsetY);
+    ctx.font = THEME.hintFont;
+    ctx.fillText(message.hint, width / 2, height / 2 + THEME.hintOffsetY);
+  }
+
+  function render(ctx, state) {
+    const { paddle, ball, config } = state;
+    ctx.fillStyle = THEME.background;
+    ctx.fillRect(0, 0, config.width, config.height);
+    drawBricks(ctx, state);
+    ctx.fillStyle = THEME.paddle;
+    ctx.fillRect(paddle.x, paddle.y, paddle.w, paddle.h);
+    ctx.fillStyle = THEME.ball;
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+    ctx.fill();
+    drawHud(ctx, state);
+    drawMessage(ctx, state);
+  }
+
+  // ---------------------------------------------------------------------
+  // Browser bootstrap: input wiring and the frame loop
+  // ---------------------------------------------------------------------
+  const KEY_TO_INPUT = { ArrowLeft: 'left', ArrowRight: 'right' };
+  const MS_PER_SECOND = 1000;
+
+  function bindInput(canvas, state, input) {
+    document.addEventListener('keydown', function (event) {
+      // Leave browser shortcuts such as Alt+Left alone.
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
+      if (event.code === 'Space') {
+        event.preventDefault();
+        if (!event.repeat) pressAction(state);
+      } else if (KEY_TO_INPUT[event.key]) {
+        event.preventDefault();
+        input[KEY_TO_INPUT[event.key]] = true;
+      }
+    });
+    document.addEventListener('keyup', function (event) {
+      if (KEY_TO_INPUT[event.key]) input[KEY_TO_INPUT[event.key]] = false;
+    });
+    window.addEventListener('blur', function () {
+      input.left = false;
+      input.right = false;
+    });
+    // On document so the paddle keeps following when the cursor leaves the canvas.
+    document.addEventListener('mousemove', function (event) {
+      // Map client px to canvas px: skip the border, undo any CSS scaling.
+      const contentLeft = canvas.getBoundingClientRect().left + canvas.clientLeft;
+      movePaddle(state, (event.clientX - contentLeft) * canvas.width / canvas.clientWidth);
+    });
+  }
+
+  function boot() {
+    const canvas = document.getElementById('game');
+    const ctx = canvas && canvas.getContext && canvas.getContext('2d');
+    if (!ctx) return;
+    const state = createState();
+    const input = { left: false, right: false };
+    canvas.width = state.config.width;
+    canvas.height = state.config.height;
+    bindInput(canvas, state, input);
+
+    let previous = null;
+    function frame(timestamp) {
+      const dt = previous === null ? 0 : (timestamp - previous) / MS_PER_SECOND;
+      previous = timestamp;
+      step(state, dt, input);
+      render(ctx, state);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+
+  if (typeof document !== 'undefined' && typeof requestAnimationFrame === 'function') boot();
+})();
+</script>
+</body>
+</html>
